@@ -1,0 +1,362 @@
+---
+title: "CTR_prediction"
+output: html_document
+---
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE, include=FALSE}
+
+load("~/ctr_prediction.RData")
+
+library(dplyr)
+library(data.table)
+library(knitr)
+library(rpart)
+library(caret)
+library(plyr)
+library(caret)
+library(GGally)
+library(stringr)
+library(rattle)
+library(pROC)
+library(ROCR)
+library(BBmisc)
+library(fastDummies)
+library(OneR)
+library(outliers)
+library(tidyverse)
+library(rsparse)
+library(class)
+library(Matrix)
+library(rbin)
+
+
+```
+
+
+```{r cache=TRUE, message=FALSE, error=FALSE, warning=FALSE, eval=FALSE}
+#Packages
+
+library(dplyr)
+library(data.table)
+library(knitr)
+library(rpart)
+library(caret)
+library(plyr)
+library(caret)
+library(GGally)
+library(stringr)
+library(rattle)
+library(pROC)
+library(ROCR)
+library(BBmisc)
+library(fastDummies)
+library(OneR)
+library(outliers)
+library(tidyverse)
+library(rsparse)
+library(class)
+library(Matrix)
+library(rbin)
+
+
+#the data was prepared in advanced using terminal: a huge, 22GB dataset was randomly sampled into smaller partitions
+
+##This part will show schematically the data preparation process
+
+str(data2) #show data structure
+summary(data2) #show data statistics
+
+##NAs and outliers detection/cleansing
+
+data2$id<- rownames(data2) #assign id column
+
+###substitute numeric NAs with mean, categorical - with mode
+
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+} #function taken from https://stackoverflow.com/questions/2547402/is-there-a-built-in-function-for-finding-the-mode/8189441#8189441
+
+
+data2<- data2 %>% mutate_if(is.numeric, funs(replace(.,is.na(.), mean(., na.rm = TRUE)))) %>%
+  mutate_if(is.factor, funs(replace(.,is.na(.), Mode(na.omit(.))))) %>% mutate_if(is.character, funs(replace(.,is.na(.), Mode(na.omit(.)))))
+
+###extract only numerical columns
+num_cols <- unlist(lapply(data2, is.numeric))  
+data_num <- data2[ , num_cols] 
+
+
+###substitute outliers: outlier is what is below the first quartile - 1.5·IQR or above third quartile + 1.5·IQR; the function substitues outliers to 5% quant value and 95% quant value
+
+clean_outliers<-   function(input) {
+      x<- input
+      qnt <- quantile(x, probs=c(.25, .75), na.rm = T)
+      caps <- quantile(x, probs=c(.05, .95), na.rm = T)
+      H <- 1.5 * IQR(x, na.rm = T)
+      x[x < (qnt[1] - H)] <- caps[1]
+      x[x > (qnt[2] + H)] <- caps[2]
+     input<-x  
+  } #based on https://stackoverflow.com/questions/30303070/removing-outliers-in-one-step
+  
+
+
+data_num<- sapply(data_num, function(x) clean_outliers(x)) #apply clean_outliers function to all numeric columns
+data_num<-as.data.frame(data_num)
+
+data_num<- mutate(data_num,id=rownames(data_num)) #assign id column
+
+###Merge dataset back
+
+data2<-merge(data_num,data2)
+
+
+###There are too many categories in this dataset, so some of them would need to be generalized through labels concatenation. E.g.:
+
+data2$device<- paste(data2$device, data2$os, sep = "_")
+
+
+###Deleting columns which won't be in use
+
+yyy<- data2
+yyy<- subset(yyy, select = -c(long_id1,long_id2))
+
+
+###Re-coding factors (for now, there values are 'yes' and 'no' - I want to convert them to normal binary format)
+
+yyy<- lapply(yyy, function(x) {ifelse(x == "yes", 1, 0)})
+
+
+
+##Grouping features: since there are still too many (categorical) features, I combine them into one, trying to achieve as maximum of 3 categories per feature. I do this procedure with all features containing too many categories.
+
+banner_pos<- yyy%>% group_by(banner_pos) %>% dplyr::summarise(count = n()) %>% arrange(desc(count)) #I group observations by operation system variable and count observations per group
+
+banner_pos<- ifelse(yyy$banner_pos!= c("Upper", "Middle"),"Other",c("Upper", "Middle")) #re-write re-grouped column of interest
+
+###This is not a perfect way to do so, however, since data was very complex, I wanted to do it in this way. Otherwise rougher methodology could be used:
+
+upper <- c("secondary", "tertiary")
+out <- rbin_factor_combine(data2, education, upper, "upper")
+rbin_factor_create(out, education) #https://www.r-bloggers.com/binning-data-with-rbin/
+
+
+###I do the same procedure with all numerical features, assigning them to bins. Here, I wanted to play with categorical dataset (for factorization machines), so I do it not in the most sophisticated way again:
+
+cpc_new<- aggregate(yyy$cpc, by=list(nmp=yyy$cpc), FUN=NROW)
+cpc_new<- ifelse(cpc_new$x > 5, "Very high", (ifelse(cpc_new$x>3 & cpc_new$x<5, "High", (ifelse(cpc_new$x<3, "Cheap")))))
+
+###...but usually I would do another type of manual binning, like:
+
+bins <- rbin_manual(yyy, y, age, c(29, 31, 34, 36, 39, 42, 46, 51, 56)) #this would create 10 bins based on age:1-29,30-31,32-34,etc.
+
+rbin_create(yyy, age, bins)
+
+###...or quantile binning: dividing dataset approximately on the same groups based on their quantiles
+
+bins <- rbin_quantiles(yyy, y, age, 5) #this would create 5 bins of approx. same length
+
+
+##CTR compilation. CTR = click-through rate, so (count of clicks)/(count of impressions)
+
+ctr_01<- yyy %>% group_by(id) %>% dplyr::summarise(impressions_count = n())
+ctr_02<- aggregate(yyy$click == "1", by=list(ad_id), FUN=sum)
+yyy$ctr<- ctr_02$x/ctr_01$impressions_count
+
+
+###CTR - deal with outliers
+
+yyy$ctr<- clean_outliers(input = yyy$ctr)
+
+###CTR category
+
+
+yyy$ctr_category<-  ifelse(yyy$ctr >= 0.5, "Very_High", ifelse(yyy$ctr < 0.5 & yyy$ctr > 0.1, "Normal", ifelse(yyy$ctr <= 0.1, "Low", yyy$ctr )))      
+
+
+##Final preparations
+
+
+y_final_sub <- yyy %>% group_by_if(is.character, as.factor) #convert characters to factors
+y_final_sub <- yyy %>% group_by_if(is.integer, as.numeric) #convert ints to nums
+
+###I need to normalise data, so I divide it again into numeric and factor subsets
+
+y_final_sub$id<- as.factor(y_final_sub$id) #make sure that ID column will stay with factor subset
+num_cols <- unlist(lapply(y_final_sub, is.numeric))  
+data_num <- data2[ , num_cols] 
+
+fact_cols <- unlist(lapply(y_final_sub, is.factor))  
+data_fact <- data2[ , fact_cols] 
+
+
+data_num<- normalize(data_num, method = "range", range = c(0,1)) #this will scale data from 0 to 1
+
+data_num<-as.data.frame(data_num)
+
+data_num<- mutate(data_num,id=rownames(data_num)) #assign id column
+
+###Merge dataset back
+
+y_final_sub<-merge(data_num,data_fact)
+
+
+### Here I could subset a data fracton for easier work
+
+y_final_sub<- sample_frac(yyy_final_sub, 0.1) #randomly sampled 10% of the data
+data_ctr<- y_final_sub
+
+##Dummies creation
+
+
+y_final_ctr<- dummy_cols(y_final_sub) 
+
+
+
+#use y_final_ctr for dummy-cols dataset; use data_ctr for non-dummy cols dataset
+
+```
+
+
+```{r cache=TRUE, message=FALSE, error=FALSE, warning=FALSE, eval=FALSE}
+##Create test and train data
+
+###data_ctr - w/o dummy cols
+
+train<- createDataPartition(data_ctr$ctr_category,p=0.02,list=FALSE)
+t_train<- data_ctr[train,]
+t_test<- data_ctr[-train,]
+train.control <- trainControl(method = "cv", number = 10)
+
+###y_final_ctr - with dummy cols
+
+train_d<- createDataPartition(y_final_ctr$ctr_category,p=0.02,list=FALSE)
+t_train_d<- y_final_ctr[train_d,]
+t_test_d<- y_final_ctr[-train_d,]
+train.control_d <- trainControl(method = "cv", number = 10)
+
+
+```
+
+```{r cache=TRUE, message=FALSE, error=FALSE, warning=FALSE, eval=FALSE}
+#RANDOM FOREST
+
+set.seed(1234)
+
+rf_fit <- train(ctr_category ~., data=t_train, method='rf', metric = 'Accuracy',  trControl=train.control)
+
+test_pred_rf <- predict.train(rf_fit, newdata = t_test)
+
+conf_matrix_fit_rf<- confusionMatrix(test_pred_rf, t_test$ctr_category) #accuracy = 0.997 - overfitting occured, most probably because of small sample size
+```
+
+```{r cache=TRUE, message=FALSE, error=FALSE, warning=FALSE}
+
+#random forest
+
+conf_matrix_fit_rf
+```
+
+
+```{r cache=TRUE, message=FALSE, error=FALSE, warning=FALSE, eval=FALSE}
+#FACTORIZATION_MACHINES
+
+#for factorization machines, I want to use data with dummy columns - y_final_ctr
+
+data_matrix<- as.matrix(y_final_ctr) #I need to convert data frame to matrix so later it will be possible to convert it into sparse matrix
+
+m<- data_matrix
+m<- as(data_matrix, "sparseMatrix") 
+y<- fact_data2$ctr_category_Normal
+
+fm = FactorizationMachine$new(learning_rate_w = 10, rank = 2, lambda_w = 0, lambda_v = 0, family = 'binomial', intercept = TRUE)
+
+res = fm$partial_fit(x = m, y = y, n_iter = 10)
+preds = fm$predict(m)
+
+new_m<- fact_data2%>% mutate(preds = preds)
+new_m<- fact_data2%>% mutate(acc = if_else(preds == ctr_category_Normal, 1, 0))
+result<- new_m %>% summarise(mean_accuracy = mean(acc))
+
+#mean accuracy without model validation = 0.9628 >> here is overfitting since I wasn't validating the model on train/test datasets
+
+```
+
+```{r echo=FALSE}
+
+#Factorization Machines result
+
+print(result)
+```
+
+
+```{r cache=TRUE, message=FALSE, error=FALSE, warning=FALSE, eval=FALSE}
+
+#KNN
+
+set.seed(3333) #example is reproducable now
+
+knn_fit <- train(ctr_category ~ ., data = t_train, method = "knn",
+ trControl=train.control,
+ tuneLength = 10)
+
+test_pred_knn <- predict.train(knn_fit, newdata = t_test)
+
+conf_matrix_knn<- confusionMatrix(test_pred, t_test$ctr_category) #accuracy = 0.6544
+
+
+#LOGISTIC REGRESSION: CLICK PREDICTION
+
+set.seed(3333)
+
+t_train_d$clicked_1<- as.factor(t_train_d$clicked_1)
+
+model_glm <- glm(click_0 ~ .,family=binomial(link='logit'),data=t_train_d, maxit =100)
+summary(model)
+
+m_glm<- predict(model_glm, t_test_d)
+pr_glm<- prediction(m_glm, t_test_d$clicked_1)
+prf_glm <- performance(pr_glm, measure = "tpr", x.measure = "fpr")
+plot(prf_glm)
+prf_glm
+auc_glm <- performance(pr_glm, measure = "auc")
+auc_glm <- auc_glm@y.values[[1]]
+auc_glm #0.57 on click prediction
+
+
+#LOGISTIC REGRESSION: CTR CATEGORY PREDICTION
+
+set.seed(3333)
+
+t_train_d$ctr_category_Very_High<- as.factor(t_train_d$ctr_category_Very_High)
+
+model <- glm(ctr_category_Very_High ~ .,family=binomial(link='logit'),data=t_train_d, maxit =100)
+summary(model)
+
+m33<- predict(model, t_test_d)
+pr<- prediction(m33, t_test_d$ctr_category_Very_High)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+prf
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc #0.37 on ctr category prediction
+
+
+```
+
+```{r echo=FALSE}
+
+#knn
+
+conf_matrix_knn
+
+#auc_glms
+
+auc_glm_click<- 0.57
+auc_glm_click
+
+auc_glm_ctr_cat_high<- 0.37
+auc_glm_ctr_cat_high
+
+```
+

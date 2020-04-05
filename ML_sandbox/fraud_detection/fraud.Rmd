@@ -1,0 +1,236 @@
+---
+title: "fraud_detection"
+author: "Thais"
+date: "4/4/2020"
+output: html_document
+---
+
+```{r, echo=TRUE, cache=TRUE, error=FALSE, message=FALSE}
+
+if ("rmarkdown" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("rmarkdown")
+}
+
+#packages
+
+library(dplyr)
+library(knitr)
+library(lubridate)
+library(ggplot2)
+library(xgboost)
+library(Matrix)
+
+
+
+##data is taken from https://www.kaggle.com/c/talkingdata-adtracking-fraud-detection
+
+setwd("C:/Users/Tess/Desktop/analytics-portfolio-t/ML sandbox/fraud_detection")
+load("C:/Users/Tess/Desktop/analytics-portfolio-t/ML sandbox/fraud_detection/fraud_env_only.RData")
+
+
+##since the data is around 7GB, I split it so R can easier process it. I do this using R Terminal with the commands "head -1 train.csv > sub_train.csv" and "perl -ne 'print if (rand() < .01)' train.csv > subset_train.csv". The first command takes the first line with headers and writes it into a new file, the second command randomly takes 1% of the data and then writes it to the same file. I do the same for the test data.
+
+fr_train<- read.csv("sub_train.csv")
+fr_test<- read.csv("sub_test.csv")
+print(head(fr_train)) #train df has is_attributed column >> our target column showing where a user downloaded an app after click + attributed_time column with time of app downloaded
+print(summary(fr_train))
+print(head(fr_test)) #test df has click_id column 
+
+```
+```{r, echo=TRUE, cache=TRUE, error=FALSE, message=FALSE, eval=FALSE}
+time_funct<- function(df,time_col){
+  #custom function to deal with time columns
+y<- df
+y$time_col<- df %>% ymd_hms(time_col) #convert click_time column to POSIXct format
+y$dow<- df %>% wday(time_col) #create column showing day of week number, where 1 = Sunday
+y$doy<- df %>% yday(time_col) #create column showing day of year number
+y$hour<- df %>% hour(time_col) #create column showing hour of click
+y$minute<- df %>% minute(time_col) #create column showing minute of click
+y<- y %>% select(-time_col)
+head(y)
+}
+
+
+applying time funtion to all datasets
+
+fr_train_time<- time_funct(df = fr_train, time_col = "click_time")
+fr_train_time<- time_funct(df = fr_train, time_col = "attributed_time")
+fr_test_time<- time_funct(df = fr_test, time_col = "click_time")
+```
+
+
+```{r, include = FALSE, echo=FALSE, cache=TRUE, error=FALSE, message=FALSE, include=FALSE}
+y<- fr_train
+y$click_time<- ymd_hms(y$click_time) #convert click_time column to POSIXct format
+y$dow_click<- wday(y$click_time) #create column showing day of week number, where 1 = Sunday
+y$doy_click<- yday(y$click_time) #create column showing day of year number
+y$hour_click<- hour(y$click_time) #create column showing hour of click
+y$minute_click<- minute(y$click_time) #create column showing minute of click
+y<- select(y, -click_time)
+fr_train_time<- y
+
+y<- fr_train_time
+y$attributed_time<- ymd_hms(y$attributed_time) #convert click_time column to POSIXct format
+y$dow_attr<- wday(y$attributed_time) #create column showing day of week number, where 1 = Sunday
+y$doy_attr<- yday(y$attributed_time) #create column showing day of year number
+y$hour_attr<- hour(y$attributed_time) #create column showing hour of click
+y$minute_attr<- minute(y$attributed_time) #create column showing minute of click
+y<- select(y, -attributed_time)
+fr_train_time<- y
+
+y<- fr_test
+y$click_time<- ymd_hms(y$click_time) #convert click_time column to POSIXct format
+y$dow_click<- wday(y$click_time) #create column showing day of week number, where 1 = Sunday
+y$doy_click<- yday(y$click_time) #create column showing day of year number
+y$hour_click<- hour(y$click_time) #create column showing hour of click
+y$minute_click<- minute(y$click_time) #create column showing minute of click
+y<- select(y, -click_time)
+fr_test_time<- y
+
+
+```
+
+```{r,  echo=TRUE, cache=TRUE, error=FALSE, message=FALSE}
+#group data by is_attributed
+
+
+train_attr_no<- fr_train_time %>% filter(is_attributed == 0) %>% group_by(hour_click) %>% tally() %>% arrange(hour_click)
+
+print(train_attr_no)
+
+
+train_attr_no_plot <- ggplot(train_attr_no, aes(x=hour_click, y=n)) +
+  geom_line(colour="blue") + xlab("") + scale_x_continuous(breaks = c(0,2,4,6,8,10,12,14,16,18,20,22,24)) #for some reasons programmatic setting of breaks didn't seem to be working, so here is an old-school way
+print(train_attr_no_plot)
+
+train_attr_grouped<- fr_train_time %>% group_by(ip,channel) %>% add_tally() #I group dataset by ip, channel, and hour_click
+head(train_attr_grouped)
+
+test_attr_grouped<- fr_test_time %>% group_by(ip,channel) %>% add_tally() #the same for test dataset
+
+```
+
+```{r, echo=TRUE, cache=TRUE, error=FALSE, message=FALSE}
+#XGBoost library will be used for predictions https://xgboost.readthedocs.io/en/latest/R-package/xgboostPresentation.html
+
+#data preparation
+
+#Unselect extra features
+train_attr_grouped<- train_attr_grouped %>% select(-c(dow_attr,doy_attr,hour_attr,minute_attr,hour_click,ip))
+train_attr_grouped<- train_attr_grouped[,-1]
+train_attr_grouped<-train_attr_grouped[,-8]
+
+#Rename to have backup
+
+data_cleaned<- train_attr_grouped
+
+data_labels<- data_cleaned[,5]
+data_wo_isatrr<- data_cleaned %>% select(-c(is_attributed)) #I will use this one
+
+#Repeat for test data
+
+test_attr_grouped<- test_attr_grouped %>% select(-c(hour_click,ip))
+test_attr_grouped<- test_attr_grouped[,-1]
+test_attr_grouped<-test_attr_grouped[,-8]
+
+test_cleaned<- test_attr_grouped
+
+```
+
+
+
+```{r, echo=TRUE, cache=TRUE, error=FALSE, message=FALSE}
+
+#More data preparation
+
+#data_wo_isatrr, data_labels
+
+data_m<- data.matrix(data_wo_isatrr) #the main training data
+data_labels2<- t(data_labels) #need to transpose labels vector so its length will be later equal to number of rows of data_m
+
+test_m<- data.matrix(test_cleaned) #the main testing data w/o target label
+test_m<-test_m[,-1]
+
+#for the first round of testing, splitting train dataset to train01 and test01
+
+numberOfTrainingSamples <- round(length(data_labels2) * .7)
+
+# training data
+train_data <- data_m[1:numberOfTrainingSamples,]
+train_labels <- data_labels2[1:numberOfTrainingSamples]
+
+# testing data
+test_data <- data_m[-(1:numberOfTrainingSamples),]
+test_labels <- data_labels2[-(1:numberOfTrainingSamples)]
+
+#convert to xgbMatrix
+
+dtrain <- xgb.DMatrix(data = train_data, label= train_labels)
+dtest <- xgb.DMatrix(data = test_data, label= test_labels)
+
+dtest_main<- xgb.DMatrix(data = test_m)
+
+```
+
+
+```{r, echo=TRUE, cache=TRUE, error=FALSE, message=FALSE}
+#Created XGB model
+
+#initial model
+model_tuned <- xgboost(data = dtrain, # the data           
+                 max.depth = 2, # the maximum depth of each decision tree
+                 nround = 2, # max number of boosting iterations
+                 objective = "binary:logistic") # the objective function 
+
+# generate predictions for our held-out testing data
+pred <- predict(model_tuned, dtest)
+
+# get & print the classification error
+err <- mean(as.numeric(pred > 0.5) != test_labels)
+print(paste("test-error=", err)) #test-error = 0.0025 - here might be overfitting >>> try to balance classes (more examples from one category than the other)
+
+#_________________________Balanced classes, adding gamma______________
+
+# get the number of negative & positive cases in our data
+negative_cases <- sum(train_labels == 0)
+postive_cases <- sum(train_labels == 1)
+
+
+#try adding gamma to avoid over-fitting is adding a regularization term, gamma. Gamma is a measure of how much an additional split will need to reduce loss in order to be added to the ensemble. By default it's 0.
+
+# train a model using our training data
+model_tuned <- xgboost(data = dtrain, # the data           
+                 max.depth = 6, # the maximum depth of each decision tree
+                 nround = 10, # number of boosting rounds
+                 early_stopping_rounds = 5, # if we dont see an improvement in this many rounds, stop
+                 objective = "binary:logistic", # the objective function
+                 scale_pos_weight = negative_cases/postive_cases, # control for imbalanced classes
+                 gamma = 0.8) # add a regularization term: the model is more conservative, so it doesn't end up adding the models which were reducing the accuracy.
+
+# generate predictions for our held-out testing data
+pred <- predict(model_tuned, dtest)
+
+# get & print the classification error
+err <- mean(as.numeric(pred > 0.5) != test_labels)
+print(paste("test-error=", err)) #test-error = 0.0203
+
+#_________________________Results______________
+
+#Max.depth of trees = 2, nround = 2 gives test_error 0.0025 at nround=2 and w/o balancing classes  and adding gamma;
+#Max.depth of trees = 2, nround = 2 gives test_error 0.226 at nround=2 and with balancing classes  and adding gamma = 0.8;
+#Max. depth of trees = 6, nround = 10 with stopping after 5 if no improvement gives test error of 0.0203
+
+#View feature importance
+importance_matrix <- xgb.importance(model = model_tuned)
+print(importance_matrix)
+features_importance<- xgb.plot.importance(importance_matrix = importance_matrix)
+print(features_importance)
+
+
+#Trying to predict on 'real' test data, withou lables:
+
+pred_real <- predict(model_tuned, dtest_main)
+err <- mean(as.numeric(pred_real > 0.5) != test_labels)
+print(paste("test-error=", err)) #test-error = 0.0434
+```
+

@@ -1,0 +1,390 @@
+---
+title: "amazon_reviews"
+output: html_document
+---
+
+```{r}
+#The main source: https://justrthings.com/2019/03/03/web-scraping-amazon-reviews-march-2019/
+#https://justrthings.com/2019/03/04/sentiment-analysis-word-embedding-and-topic-modeling-on-venom-reviews/
+
+#SCAPPING AMAZON PAGES
+
+#install.packages("pacman")
+pacman::p_load(rvest, dplyr, tidyr, stringr, ggplot)
+
+prod_code <- "B01FVNA1D6"
+url<- paste0("https://www.amazon.com/dp/", prod_code)
+doc <- read_html(url)
+prod <- html_nodes(doc, "#productTitle") %>% 
+  html_text() %>% 
+  gsub("\n", "", .) %>% 
+  trimws()
+prod
+# Function to scrape elements from Amazon reviews
+scrape_amazon <- function(url, throttle = 0){
+# Install / Load relevant packages
+if(!"pacman" %in% installed.packages()[,"Package"]) install.packages("pacman")
+pacman::p_load(RCurl, XML, dplyr, stringr, rvest, purrr)
+
+# Set throttle between URL calls
+sec = 0
+if(throttle < 0) warning("throttle was less than 0: set to 0")
+if(throttle > 0) sec = max(0, throttle + runif(1, -1, 1))
+
+# obtain HTML of URL
+doc <- read_html(url)
+
+# Parse relevant elements from HTML
+title <- doc %>%
+html_nodes("#cm_cr-review_list .a-color-base") %>%
+html_text()
+
+author <- doc %>%
+html_nodes("#cm_cr-review_list .a-profile-name") %>%
+html_text()
+
+date <- doc %>%
+html_nodes("#cm_cr-review_list .review-date") %>%
+html_text() %>% 
+gsub(".*on ", "", .)
+
+review_format <- doc %>% 
+html_nodes(".review-format-strip") %>% 
+html_text() 
+
+stars <- doc %>%
+html_nodes("#cm_cr-review_list  .review-rating") %>%
+html_text() %>%
+str_extract("\\d") %>%
+as.numeric() 
+
+comments <- doc %>%
+html_nodes("#cm_cr-review_list .review-text") %>%
+html_text() 
+
+suppressWarnings(n_helpful <- doc %>%
+html_nodes(".a-expander-inline-container") %>%
+html_text() %>%
+gsub("\n\n \\s*|found this helpful.*", "", .) %>%
+gsub("One", "1", .) %>%
+map_chr(~ str_split(string = .x, pattern = " ")[[1]][1]) %>%
+as.numeric())
+
+# Combine attributes into a single data frame
+df<- data.frame(title, author,date, review_format, stars, comments, stringsAsFactors = F)
+
+}
+
+# load DT packege
+pacman::p_load(DT)
+library(DT)
+# run scraper function
+url <- "http://www.amazon.com/product-reviews/B01FVNA1D6/?pageNumber=1"
+reviews <- scrape_amazon(url)
+
+# display data
+str(reviews)
+
+# Set # of pages to scrape. Note: each page contains 8 reviews.
+pages <- 50
+
+# create empty object to write data into
+reviews_all_v <- NULL
+
+# loop over pages
+reviews_all<- for(page_num in 1:pages) {
+  url <- paste0("http://www.amazon.com/product-reviews/",prod_code,"/?pageNumber=", page_num)
+  reviews <- scrape_amazon(url, throttle = 3)
+  reviews_all_v <- rbind(reviews_all_v, cbind(prod, reviews))
+}
+
+review_df <- reviews_all_v %>%
+  mutate(id = row_number())
+
+str(reviews_all_v)
+
+
+#TEXT MINING
+
+
+#Vocabulary creation
+
+pacman::p_load(text2vec, tm, ggrepel)
+
+library(text2vec)
+# create lists of reviews split into individual words (iterator over tokens)
+tokens <- space_tokenizer(review_df$comments %>%
+                            tolower() %>%
+                            removePunctuation())
+
+# Create vocabulary. Terms will be unigrams (simple words).
+it <- itoken(tokens, progressbar = FALSE)
+vocab <- create_vocabulary(it)
+
+# prune words that appear less than 3 times
+vocab <- prune_vocabulary(vocab, term_count_min = 3L)
+
+# Use our filtered vocabulary
+vectorizer <- vocab_vectorizer(vocab)
+
+# use skip gram window of 5 for context words
+tcm <- create_tcm(it, vectorizer, skip_grams_window = 5L)
+
+# fit the model. (It can take several minutes to fit!)
+glove = GloVe$new(word_vectors_size = 100, vocabulary = vocab, x_max = 5)
+glove$fit_transform(tcm, n_iter = 20)
+
+# obtain word vector
+word_vectors = glove$components
+
+
+#Sentiment
+
+pacman::p_load(tidyr, stringr, data.table, sentimentr, ggplot2)
+# words to replace
+replace_in_lexicon <- tribble(
+  ~x, ~y,
+  "marvel", 0,  # original score: .75
+  "venom", 0,   # original score: -.75
+  "alien", 0,   # original score: -.6
+  "bad@$$", .4, # not in dictionary
+  "carnage", 0, # original score: 0.75
+  "avenger", 0, # original score: .25
+  "riot", 0     # original score: -.5
+)
+
+# create a new lexicon with modified sentiment
+venom_lexicon <- lexicon::hash_sentiment_jockers_rinker %>%
+  filter(!x %in% replace_in_lexicon$x) %>%
+  bind_rows(replace_in_lexicon) %>%
+  setDT() %>%
+  setkey("x")
+
+pacman::p_load(text2vec, tm, ggrepel)
+# create lists of reviews split into individual words (iterator over tokens)
+tokens <- space_tokenizer(review_df$comments %>%
+                            tolower() %>%
+                            removePunctuation())
+
+
+# get sentence-level sentiment
+sent_df <- review_df %>%
+  get_sentences() %>%
+  sentiment_by(by = c('id', 'author', 'date', 'stars', 'review_format'), polarity_dt = venom_lexicon)
+
+
+
+# stars vs sentiment
+p_sent <- ggplot(sent_df, aes(x = stars, y = ave_sentiment, color = factor(stars), group = stars)) +
+  geom_boxplot() +
+  geom_hline(yintercept=0, linetype="dashed", color = "red") +
+  geom_text(aes(5.2, -0.05, label = "Neutral Sentiment", vjust = 0), size = 3, color = "red") +
+  guides(color = guide_legend(title="Star Rating")) +
+  ylab("Avg. Sentiment") +
+  xlab("Review Star Rating") +
+  ggtitle("Sentiment of Venom Amazon Reviews, by Star Rating") 
+p_sent
+
+#Here I got problems with writing date from a string, so I made some additional transformations
+
+require(devtools)
+install_github("Displayr/flipTime")
+library(flipTime)
+
+sent_df$date<- AsDate(sent_df$date)
+
+# sentiment over time
+sent_ts <- sent_df %>%
+  mutate(
+    date = date,
+    dir = sign(ave_sentiment)
+  ) 
+
+# plot
+p_t <- ggplot(sent_ts, aes(x = date, y = ave_sentiment)) +
+  geom_smooth(method="loess", size=1, se=T, span = .6) +
+  geom_vline(xintercept=as.Date("2018-10-05"), linetype="dashed", color = "black") +
+  geom_text(aes(as.Date("2018-10-05") + 1, .4, label = "Theatrical Release", hjust = "left"), size = 3, color = "black") +
+  geom_vline(xintercept=as.Date("2018-12-11"), linetype="dashed", color = "black") +
+  geom_text(aes(as.Date("2018-12-11") + 1, .4, label = "Digital Release", hjust = "left"), size = 3, color = "black") +
+  geom_vline(xintercept=as.Date("2018-12-18"), linetype="dashed", color = "black") +
+  geom_text(aes(as.Date("2018-12-18") + 1, .37, label = "DVD / Blu-Ray Release", hjust = "left"), size = 3, color = "black") +
+  geom_hline(yintercept=0, linetype="dashed", color = "red") +
+  geom_text(aes(max(sent_ts$date) - 5, -0.02, label = "Neutral Sentiment", vjust = 0), size = 3, color = "red") +
+  ylab("Avg. Sentiment") +
+  xlab("Review Date") +
+  ggtitle("Sentiment of Venom Amazon Reviews, Over Time (2018 - 2019)")
+p_t
+
+
+
+
+
+
+#TOPIC DETECTION
+
+
+
+# load packages
+#pacman::p_load(tm, topicmodels, tidytext, ldatuning)
+library(tm)
+library(topicmodels)
+library(tidytext)
+library(ldatuning)
+
+# remove words that show up in more than 5% of documents
+frequent_words <- vocab %>%
+  filter(doc_count >= nrow(review_df) * .01) %>%
+  rename(word = term) %>%
+  select(word)
+
+
+# find document-word counts
+by_review_word <- review_df %>%
+  mutate(id = 1:nrow(.)) %>%
+  unnest_tokens(word, comments)
+
+# find document-word counts
+word_counts <- by_review_word %>%
+  anti_join(stop_words, by = "word") %>%
+  count(id, word, sort = TRUE) %>%
+  ungroup()
+
+dtm <- word_counts %>%
+  cast_dtm(id, word, n)
+
+# find topics
+result <- FindTopicsNumber(
+  dtm,
+  topics = seq(from = 2, to = 15, by = 1),
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"),
+  method = "Gibbs",
+  control = list(seed = 77),
+  mc.cores = 2L,
+  verbose = TRUE
+)
+
+FindTopicsNumber_plot(result)
+
+# set a seed so that the output of the model is predictable
+my_lda <- topicmodels::LDA(dtm, k = 6, method = "Gibbs")
+
+# transform into tidy data frame
+ap_topics <- tidy(my_lda, matrix = "beta")
+
+# for each topic, obtain the top 20 words by beta
+pd <- ap_topics %>%
+  group_by(topic) %>%
+  top_n(20, beta) %>%  # top words based on informativeness
+  ungroup() %>%
+  arrange(topic, beta) %>%
+  mutate(order = row_number()) 
+
+# plot
+topicsplot<- ggplot(pd, aes(order, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  # Add categories to axis
+  scale_x_continuous(
+    breaks = pd$order,
+    labels = pd$term,
+    expand = c(0,0)
+  ) +
+  coord_flip()
+
+
+
+#Histogram of stars
+
+mean(review_df$stars)
+
+stars_hist<- hist(review_df$stars, main = "Histogram of Stars", xlab = "Stars", col = "darkred")
+summary_reviews<- summary(review_df$stars)
+
+# load packages for senitment analysis
+pacman::p_load(tidyr, stringr, data.table, sentimentr, ggplot2)
+
+# get n rows
+nrow(lexicon::hash_sentiment_jockers_rinker)
+
+# example lexicon
+head(lexicon::hash_sentiment_jockers_rinker)
+
+replace_in_lexicon <- tribble(
+  ~x, ~y,
+  "helicopter", 0, 
+  "copter", 0,
+  "dron", 0,
+  "drones", 0)
+amazon_dron_lexicon <- lexicon::hash_sentiment_jockers_rinker %>%
+  filter(!x %in% replace_in_lexicon$x) %>%
+  bind_rows(replace_in_lexicon) %>%
+  setDT() %>%
+  setkey("x")
+
+sent_df <- review_df %>%
+  get_sentences() %>%
+  sentiment_by(by = c('id', 'author', 'date', 'stars', 'review_format'), polarity_dt = amazon_dron_lexicon)
+
+###Boxplots of average sentiment review star rating
+
+p <- ggplot(sent_df, aes(x = stars, y = ave_sentiment, color = factor(stars), group = stars)) +
+  geom_boxplot() +
+  geom_hline(yintercept=0, linetype="dashed", color = "red") +
+  geom_text(aes(5.2, -0.05, label = "Neutral Sentiment", vjust = 0), size = 3, color = "red") +
+  guides(color = guide_legend(title="Star Rating")) +
+  ylab("Avg. Sentiment") +
+  xlab("Review Star Rating") +
+  ggtitle("Sentiment of Force 1 Mini Drones Amazon Reviews, by Star Rating") 
+p
+
+
+
+##Text cleansing and word cloud
+
+#install.packages(c("tm",'dplyr','SnowballC','wordcloud','RColorBrewer'))
+library(tm)
+library(dplyr)
+library(SnowballC)
+library(wordcloud)
+library(RColorBrewer)
+
+review_df$text <- review_df$comments
+uncleaned<- data.frame(doc_id=row.names(review_df),text=review_df$comments)
+corp <- Corpus(DataframeSource(uncleaned))
+
+toSpace <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+docs <- tm_map(corp, toSpace, "/")
+docs <- tm_map(corp, toSpace, "/")
+docs <- tm_map(corp, toSpace, "@")
+docs <- tm_map(corp, toSpace, "\\|")
+docs <- tm_map(docs, content_transformer(tolower))
+docs <- tm_map(docs, removeNumbers)
+docs <- tm_map(docs, removeWords, stopwords("english"))
+docs <- tm_map(docs, removeWords, c("eduubdedubub"))
+docs <- tm_map(docs, removePunctuation)
+docs <- tm_map(docs, stripWhitespace)
+docs <- tm_map(docs, stemDocument)
+```
+
+#Convert in into term document matrix
+
+```{r}
+dtm <- TermDocumentMatrix(docs)
+m <- as.matrix(dtm)
+v <- sort(rowSums(m),decreasing=TRUE)
+d <- data.frame(word = names(v),freq=v)
+```
+
+#Create wordcloud
+
+```{r}
+set.seed(1234)
+wordcloud_amazon<- wordcloud(words = d$word, freq = d$freq, min.freq = 1, max.words=200, random.order=FALSE, rot.per=0.35, colors=brewer.pal(3, "Dark2"))
+png("wordcloud_amazon2.png")
+par(mar = rep(0, 4))
+
+```
+
+```
+

@@ -1,0 +1,1 @@
+This case is a scholar example of Marketing Analytics Using R and examines recency, frequency, monetary value analysis.

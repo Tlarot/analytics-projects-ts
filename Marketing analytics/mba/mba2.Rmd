@@ -1,0 +1,131 @@
+---
+title: "mba_2"
+output: html_document
+---
+```{r}
+
+##user histories case: https://www.kaggle.com/jweisber/visualizing-user-histories/notebook
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(readr)
+
+setwd("C:/Users/Tess/Desktop/TS thesis materials/thesis/instacart-market-basket-analysis")
+aisales<- read.csv('aisles.csv')
+departments<- read.csv('departments.csv')
+order_products_prior<- read.csv('order_products__prior.csv')
+order_products_train<- read.csv('order_products__train.csv')
+orders<- read.csv('orders.csv')
+products<- read.csv('products.csv')
+sample_submission<- read.csv('sample_submission.csv')
+
+train_users <- orders %>% filter(eval_set == 'train') %>% .$user_id
+order_products <- bind_rows(order_products_prior, order_products_train)
+
+products_plus <- products %>% left_join(departments, by = "department_id") %>% left_join(aisales, by = "aisle_id")
+
+set.seed(365)
+
+##function
+
+show_user <- function(u = NULL) {
+  user <- u
+  if (is.null(user)) {
+    user <- sample(train_users, 1) # show a random user if none is specified
+  }
+  
+  # build user history
+  user_history <- orders %>%
+    filter(user_id == user) %>%
+    left_join(order_products, by = "order_id") %>%
+    left_join(products_plus, by = "product_id")
+  
+  user_history$days_since_prior_order[is.na(user_history$days_since_prior_order)] <- 0
+  
+  days <- user_history %>%
+    distinct(order_number, days_since_prior_order) %>%
+    mutate(day = cumsum(days_since_prior_order)) %>%
+    select(order_number, day)
+  
+  user_history <- user_history %>%
+    left_join(days, by = "order_number") %>%
+    arrange(department, aisle, order_number)
+  
+  # order y-axis by dept, aisle
+  user_history$product_name <- factor(
+    user_history$product_name,
+    levels = products_plus %>% arrange(department, aisle) %>% .$product_name
+  )
+
+  # we'll use major/minor breaks to visualize saturday/sunday
+  day_zero_dow <- orders %>% 
+    filter(user_id == user, order_number == 1) %>% 
+    .$order_dow
+  
+  # plot it
+  ggplot(user_history, aes(day, product_name, colour = department, shape = eval_set)) +
+    geom_point() +
+    scale_x_continuous(breaks = seq(-day_zero_dow, max(user_history$day) + 7 , 7), 
+                       minor_breaks = seq(-day_zero_dow +1, max(user_history$day) + 7, 7)) +
+    ggtitle(paste("User #", user, sep = "")) + theme(plot.title = element_text(hjust = 0.5))
+}
+
+
+show_user()
+
+##how often do people rebuy
+
+##source: https://www.kaggle.com/rafaelmdourado/how-often-people-rebuy/notebook
+##finding optimal no. of clusters https://www.datanovia.com/en/lessons/determining-the-optimal-number-of-clusters-3-must-know-methods/
+
+##clusters: frequency is calculated out of mean value of days from prior sale
+
+library(dplyr)
+
+user_freq <- orders %>%
+    select(user_id, order_number, days_since_prior_order) %>%
+    group_by(user_id) %>%
+    summarise(total = max(order_number), 
+              frequency = mean(days_since_prior_order, na.rm = TRUE))
+
+user_freq<- sample_n(user_freq,1000)
+glimpse(user_freq)
+
+library(plyr)
+
+
+set.seed(42)
+clus <- kmeans(user_freq[,2:3], 4)
+clus$cluster <- as.factor(clus$cluster)
+clus$cluster<- mapvalues(clus$cluster, from = c("1","2","3","4"), to = c("Buy twice a week",  "Buy almost monthly", "Buy almost weekly", "Buy almost every 2 weeks"))
+(clus$centers)
+cluster_mba<- ggplot(user_freq,
+       aes(total, frequency, color = clus$cluster)) +
+    geom_point() + labs(fill = "Frequency of re-buying")
+
+print(cluster_mba)
+
+
+#SRS used to create a data sample
+
+#library(factoextra)
+#library(NbClust)
+#(optCluster)
+
+#sampleclus<- sample_n(user_freq[,2:3], 100)
+
+#Check the optimal number of clusters: 
+
+#NbClust(data = sampleclus, diss = NULL, distance = "euclidean", min.nc = 2, max.nc = 15, method = "kmeans")
+#fviz_nbclust(sampleclus, kmeans, method = c("silhouette", "wss", "gap_stat"))
+#optCluster(as.data.frame(sampleclus), nClust = 4)
+
+
+#Suggested no. of clusters = 2
+
+##Choosing only wss method gives an answer of 4 clusters (the point where the change of slope is sharply smaller comparing to previous point with smaller amount of clusters)
+
+##Clusters formed: Buy twice a week (1), Buy almost monthly (2), Buy almost weekly (3), Buy almost every two weeks (4)
+```
+

@@ -1,0 +1,25 @@
+---
+title: "Scholar example - basic grouping and visualization"
+output: html_notebook
+---
+
+
+```{r}
+#Read data
+movierating<- read.csv("Yourdirectory/movierating.csv")
+library(dplyr)
+library(ggplot2)
+
+#Basic transformations
+as.data.frame(movierating)
+sumstats<- summary(movierating)
+bygen<- group_by(movierating, gender)
+countbygen<- summarise(bygen, movieID = n(), avgrating = mean(rating, na.rm = T))
+countbygen<- as.data.frame(countbygen)
+
+#Chart
+chart<- ggplot(countbygen, aes(x = "gender", y = 'avgrating')) + geom_col(aes(x=gender,y=avgrating,group=gender, fill = gender), width = 0.4) + theme_classic() +  scale_fill_brewer(palette="Set2") 
+
+print(chart)
+
+```
